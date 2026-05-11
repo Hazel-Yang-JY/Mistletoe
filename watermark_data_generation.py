@@ -81,8 +81,8 @@ def get_seed_logits_and_candidates(image_path, net, device, topk=10):
 
 
 def generate_and_save(seed_image, out_dir, num_samples, perturb_dim, epsilon_range):
-    from vae import get_rec_image
-    from augment_perturb import augment
+    from tools.vae import get_rec_image
+    from tools.augment_perturb import augment
 
     os.makedirs(out_dir, exist_ok=True)
     generated_paths = []
@@ -175,6 +175,39 @@ def compute_dataset_avg_gradient(net, image_paths, target_label, device):
     return grad_sum / valid_count
 
 
+def compute_labeled_dataset_avg_gradient(net, labeled_samples, device):
+    grad_sum = None
+    valid_count = 0
+
+    for path, target_label in labeled_samples:
+        try:
+            img_tensor = load_image_tensor(path, device)
+            grad_vec = compute_single_image_gradient(
+                net,
+                img_tensor,
+                target_label,
+                device
+            )
+
+            if grad_vec is None:
+                continue
+
+            if grad_sum is None:
+                grad_sum = grad_vec.clone()
+            else:
+                grad_sum += grad_vec
+
+            valid_count += 1
+
+        except Exception as e:
+            print(f"⚠️ Skipping corrupted or unreadable image: {path} | {e}")
+
+    if grad_sum is None or valid_count == 0:
+        return None
+
+    return grad_sum / valid_count
+
+
 def list_images_in_folder(folder_path):
     if not os.path.isdir(folder_path):
         return []
@@ -212,6 +245,43 @@ def sample_same_class_images(class_dir, sample_size, seed_image=None, rng_seed=4
         return sampled
 
     return rng.sample(all_images, sample_size)
+
+
+def sample_global_balanced_labeled_images(train_dir, per_class_samples, rng_seed=42, exclude_image=None):
+    class_folders = sorted([
+        d for d in os.listdir(train_dir)
+        if os.path.isdir(os.path.join(train_dir, d))
+    ])
+
+    rng = random.Random(rng_seed)
+    exclude_abs = os.path.abspath(exclude_image) if exclude_image is not None else None
+
+    all_samples = []
+
+    for label_idx, cls in enumerate(class_folders):
+        cls_dir = os.path.join(train_dir, cls)
+        class_images = []
+
+        for name in os.listdir(cls_dir):
+            path = os.path.join(cls_dir, name)
+            if os.path.isfile(path) and name.endswith(VALID_EXTS):
+                if exclude_abs is not None and os.path.abspath(path) == exclude_abs:
+                    continue
+                class_images.append(path)
+
+        if len(class_images) == 0:
+            print(f"⚠️ 类别 {cls} 没有可用图像，跳过")
+            continue
+
+        if per_class_samples >= len(class_images):
+            selected = class_images[:]
+            rng.shuffle(selected)
+        else:
+            selected = rng.sample(class_images, per_class_samples)
+
+        all_samples.extend([(p, label_idx) for p in selected])
+
+    return all_samples
 
 
 def compute_cosine_similarity(vec_a, vec_b, eps=1e-12):
@@ -342,22 +412,25 @@ if __name__ == "__main__":
     print(f"📌 Seed class directory: {seed_class_dir}")
     print("-" * 60)
 
-    # 2. Sample images from the seed class to estimate the main-task gradient
-    main_class_paths = sample_same_class_images(
-        class_dir=seed_class_dir,
-        sample_size=MAIN_CLASS_SAMPLE_SIZE,
-        seed_image=SEED_IMAGE,
-        rng_seed=MAIN_CLASS_RANDOM_SEED
+    # 2. Sample balanced images from the whole task distribution to estimate the task gradient
+    per_class_samples = max(1, MAIN_CLASS_SAMPLE_SIZE // len(class_folders))
+
+    main_class_paths = sample_global_balanced_labeled_images(
+        train_dir=TRAIN_DIR,
+        per_class_samples=per_class_samples,
+        rng_seed=MAIN_CLASS_RANDOM_SEED,
+        exclude_image=SEED_IMAGE
     )
 
     if len(main_class_paths) == 0:
         raise RuntimeError(
-            f"❌ No valid images found in the seed class directory: {seed_class_dir}"
+            f"❌ No valid images found in the training directory: {TRAIN_DIR}"
         )
 
     print(
-        f"✅ Sampled {len(main_class_paths)} images from the seed class "
-        f"for estimating the main-task average gradient"
+        f"✅ Sampled {len(main_class_paths)} balanced images from the whole "
+        f"training distribution for estimating the main-task average gradient "
+        f"({per_class_samples} per class)"
     )
 
     # 3. Generate watermark images
@@ -374,22 +447,21 @@ if __name__ == "__main__":
     print(f"✅ Watermark image generation completed. Temporary directory: {temp_out_dir}")
     print(f"✅ Generated {len(generated_files)} watermark images")
 
-    # 4. Compute the average gradient of the main task on the seed class
-    main_grad = compute_dataset_avg_gradient(
+    # 4. Compute the average gradient of the main task on the global task distribution
+    main_grad = compute_labeled_dataset_avg_gradient(
         net=net,
-        image_paths=main_class_paths,
-        target_label=seed_top1_idx,
+        labeled_samples=main_class_paths,
         device=DEVICE
     )
 
     if main_grad is None:
         raise RuntimeError(
             "❌ Failed to compute main_grad. Please check the images, "
-            "model parameters, and class directory."
+            "model parameters, and training directory."
         )
 
     main_grad_norm = torch.norm(main_grad, p=2).item()
-    print(f"📌 Main-class average gradient norm: {main_grad_norm:.6f}")
+    print(f"📌 Main-task average gradient norm: {main_grad_norm:.6f}")
 
     print("\n🔍 Evaluating each candidate label ...\n")
 
