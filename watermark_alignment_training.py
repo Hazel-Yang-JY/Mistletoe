@@ -1,4 +1,6 @@
+import argparse
 import os
+import random
 from tqdm import tqdm
 
 import torch
@@ -64,6 +66,135 @@ USE_PERSISTENT_WORKERS = True
 PREFETCH_FACTOR = 2
 
 
+def parse_args():
+    """Expose experiment settings while preserving the original defaults."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Embed a watermark with Mistletoe's embed/attack-gradient/recover "
+            "training workflow."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--train-dir", default=TRAIN_DIR)
+    parser.add_argument("--val-dir", default=VAL_DIR)
+    parser.add_argument("--watermark-dir", default=WM_DIR)
+    parser.add_argument("--model-path", default=MODEL_PATH)
+    parser.add_argument("--save-path", default=SAVE_PATH)
+    parser.add_argument("--num-classes", type=int, default=NUM_CLASSES)
+    parser.add_argument("--watermark-class", default=WM_CLASS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--learning-rate", type=float, default=WM_LR)
+    parser.add_argument("--lambda-wm-embed", type=float, default=LAMBDA_WM_EMBED)
+    parser.add_argument("--lambda-wm-recover", type=float, default=LAMBDA_WM_RECOVER)
+    parser.add_argument("--align-coeff", type=float, default=ALIGN_COEFF)
+    parser.add_argument("--attack-ema", type=float, default=ATTACK_EMA)
+    parser.add_argument("--attack-steps", type=int, default=ATTACK_STEPS_PER_ITER)
+    parser.add_argument("--recover-steps", type=int, default=RECOVER_STEPS_PER_ITER)
+    parser.add_argument("--attack-every", type=int, default=ATTACK_EVERY)
+    parser.add_argument(
+        "--align-layers",
+        nargs="+",
+        default=ALIGN_KEYWORDS,
+        metavar="NAME",
+        help="Parameter-name fragments to which alignment is applied.",
+    )
+    parser.add_argument("--train-workers", type=int, default=NUM_WORKERS_TRAIN)
+    parser.add_argument("--watermark-workers", type=int, default=NUM_WORKERS_WM)
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Optional global RNG seed; omitted by default to preserve legacy behavior.",
+    )
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    parser.add_argument(
+        "--no-amp", action="store_true", help="Disable automatic mixed precision."
+    )
+    return parser.parse_args()
+
+
+def resolve_device(name):
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but CUDA is unavailable.")
+    return torch.device(name)
+
+
+def validate_inputs(args):
+    """Fail before training starts when paths or key settings are invalid."""
+    for label, path in (
+        ("training directory", args.train_dir),
+        ("validation directory", args.val_dir),
+        ("watermark directory", args.watermark_dir),
+    ):
+        if not os.path.isdir(path):
+            raise NotADirectoryError(f"Missing {label}: {os.path.abspath(path)}")
+    if not os.path.isfile(args.model_path):
+        raise FileNotFoundError(
+            f"Missing model checkpoint: {os.path.abspath(args.model_path)}"
+        )
+    if args.batch_size <= 0 or args.epochs <= 0:
+        raise ValueError("--batch-size and --epochs must be greater than zero.")
+    if args.num_classes <= 0:
+        raise ValueError("--num-classes must be greater than zero.")
+    if args.train_workers < 0 or args.watermark_workers < 0:
+        raise ValueError("DataLoader worker counts cannot be negative.")
+    if args.attack_steps <= 0 or args.recover_steps <= 0:
+        raise ValueError("--attack-steps and --recover-steps must be greater than zero.")
+    if args.attack_every <= 0:
+        raise ValueError("--attack-every must be greater than zero.")
+    if not 0.0 <= args.attack_ema < 1.0:
+        raise ValueError("--attack-ema must be in [0, 1).")
+    if not 0.0 <= args.align_coeff <= 1.0:
+        raise ValueError("--align-coeff must be in [0, 1].")
+
+
+def configure_from_args(args):
+    """Map CLI values onto the existing training implementation."""
+    global TRAIN_DIR, VAL_DIR, WM_DIR, MODEL_PATH, SAVE_PATH
+    global NUM_CLASSES, WM_CLASS, BATCH_SIZE, EPOCHS, DEVICE
+    global USE_AMP, AMP_DEVICE, ATTACK_STEPS_PER_ITER
+    global RECOVER_STEPS_PER_ITER, ATTACK_EVERY, WM_LR
+    global LAMBDA_WM_EMBED, LAMBDA_WM_RECOVER, ALIGN_COEFF
+    global ATTACK_EMA, NUM_WORKERS_TRAIN, NUM_WORKERS_WM, ALIGN_KEYWORDS
+
+    TRAIN_DIR = args.train_dir
+    VAL_DIR = args.val_dir
+    WM_DIR = args.watermark_dir
+    MODEL_PATH = args.model_path
+    SAVE_PATH = args.save_path
+    NUM_CLASSES = args.num_classes
+    WM_CLASS = args.watermark_class
+    BATCH_SIZE = args.batch_size
+    EPOCHS = args.epochs
+    DEVICE = resolve_device(args.device)
+    AMP_DEVICE = DEVICE.type
+    USE_AMP = DEVICE.type == "cuda" and not args.no_amp
+    ATTACK_STEPS_PER_ITER = args.attack_steps
+    RECOVER_STEPS_PER_ITER = args.recover_steps
+    ATTACK_EVERY = args.attack_every
+    WM_LR = args.learning_rate
+    LAMBDA_WM_EMBED = args.lambda_wm_embed
+    LAMBDA_WM_RECOVER = args.lambda_wm_recover
+    ALIGN_COEFF = args.align_coeff
+    ATTACK_EMA = args.attack_ema
+    NUM_WORKERS_TRAIN = args.train_workers
+    NUM_WORKERS_WM = args.watermark_workers
+    ALIGN_KEYWORDS = args.align_layers
+
+    if args.random_seed is not None:
+        random.seed(args.random_seed)
+        torch.manual_seed(args.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.random_seed)
+
+    os.makedirs(os.path.dirname(os.path.abspath(SAVE_PATH)), exist_ok=True)
+
+
 # =========================================================
 # Data Preprocessing
 # =========================================================
@@ -92,13 +223,22 @@ def build_datasets():
     train_set = ImageFolder(TRAIN_DIR, transform=train_transform)
     val_set   = ImageFolder(VAL_DIR, transform=val_transform)
 
+    if train_set.class_to_idx != val_set.class_to_idx:
+        raise ValueError(
+            "Train and validation class folders do not have identical names/order."
+        )
+    if len(train_set.classes) != NUM_CLASSES:
+        raise ValueError(
+            f"Found {len(train_set.classes)} task classes, but NUM_CLASSES={NUM_CLASSES}."
+        )
+
     if WM_CLASS not in train_set.class_to_idx:
         raise ValueError(
             f"WM_CLASS={WM_CLASS} not found in train_set.class_to_idx"
         )
 
     wm_label = train_set.class_to_idx[WM_CLASS]
-    print(f"ℹ️  {WM_CLASS} label index = {wm_label}")
+    print(f"[INFO] {WM_CLASS} label index = {wm_label}")
 
     wm_train = ImageFolder(WM_DIR, transform=train_transform)
     wm_val   = ImageFolder(WM_DIR, transform=val_transform)
@@ -111,12 +251,12 @@ def build_datasets():
     wm_val.samples = [(p, wm_label) for p, _ in wm_val.samples]
 
     print(
-        f"ℹ️  Main train set: {len(train_set)} images | "
+        f"[INFO] Main train set: {len(train_set)} images | "
         f"Main val set: {len(val_set)} images"
     )
 
     print(
-        f"ℹ️  Watermark train set: {len(wm_train)} images | "
+        f"[INFO] Watermark train set: {len(wm_train)} images | "
         f"Watermark val set: {len(wm_val)} images"
     )
 
@@ -402,7 +542,8 @@ def train_attack_gradient_probe_fast(
             range(len(main_loader)),
             desc=f"Fast-Train [{epoch}/{EPOCHS}]",
             unit="iter",
-            dynamic_ncols=True
+            dynamic_ncols=True,
+            ascii=True,
         )
 
         for _ in pbar:
@@ -579,11 +720,11 @@ def train_attack_gradient_probe_fast(
                 "recover": f"{recover_loss_val:.4f}",
                 "wm_e": (
                     f"{wm_loss_embed:.4f}"
-                    if wm_loss_embed is not None else "—"
+                    if wm_loss_embed is not None else "-"
                 ),
                 "wm_r": (
                     f"{recover_wm_loss_disp:.4f}"
-                    if recover_wm_loss_disp is not None else "—"
+                    if recover_wm_loss_disp is not None else "-"
                 ),
                 "acc": (
                     f"{100.0 * main_correct / max(total_samples, 1):.2f}%"
@@ -597,7 +738,7 @@ def train_attack_gradient_probe_fast(
         wm_scheduler.step()
 
         print(
-            f"  ↳ avg_embed={total_embed_loss / len(main_loader):.4f}  "
+            f"  avg_embed={total_embed_loss / len(main_loader):.4f}  "
             f"avg_attack_grad={total_attack_loss / len(main_loader):.4f}  "
             f"avg_recover={total_recover_loss / len(main_loader):.4f}  "
             f"train_acc={100.0 * main_correct / max(total_samples, 1):.2f}%"
@@ -621,7 +762,7 @@ def train_attack_gradient_probe_fast(
 
         torch.save(net.state_dict(), SAVE_PATH)
 
-        print(f"  💾 Saved model -> {SAVE_PATH}")
+        print(f"  [SAVE] Model -> {SAVE_PATH}")
 
         if clean_val_acc > best_clean_val:
             best_clean_val = clean_val_acc
@@ -629,7 +770,7 @@ def train_attack_gradient_probe_fast(
         if wm_val_acc > best_wm_val:
             best_wm_val = wm_val_acc
 
-    print(f"\n✅ Training completed!")
+    print("\n[OK] Training completed!")
     print(f"   Model saved to {SAVE_PATH}")
     print(f"   Best Clean Val Acc = {best_clean_val:.2f}%")
     print(f"   Best WM Val Acc    = {best_wm_val:.2f}%")
@@ -639,10 +780,17 @@ def train_attack_gradient_probe_fast(
 # Main
 # =========================================================
 if __name__ == "__main__":
-    print(f"🖥️  Device: {DEVICE}")
-    print(f"⚡ USE_AMP: {USE_AMP}")
-    print(f"⚡ ALIGN_KEYWORDS: {ALIGN_KEYWORDS}")
-    print(f"⚡ ATTACK_EVERY: {ATTACK_EVERY}\n")
+    args = parse_args()
+    validate_inputs(args)
+    configure_from_args(args)
+
+    print("=" * 60)
+    print("Mistletoe | Stage 2/2: alignment training")
+    print("=" * 60)
+    print(f"Device: {DEVICE}")
+    print(f"USE_AMP: {USE_AMP}")
+    print(f"ALIGN_KEYWORDS: {ALIGN_KEYWORDS}")
+    print(f"ATTACK_EVERY: {ATTACK_EVERY}\n")
 
     train_set, wm_train, val_set, wm_val, wm_label = build_datasets()
 
@@ -678,11 +826,11 @@ if __name__ == "__main__":
         drop_last=False,
     )
 
-    print(f"🔧 Loading base model: {MODEL_PATH}")
+    print(f"Loading base model: {MODEL_PATH}")
 
     net = load_model(MODEL_PATH, NUM_CLASSES, DEVICE)
 
-    print("\n📊 [Before Training]")
+    print("\n[Before Training]")
     evaluate(
         net,
         val_loader,
@@ -700,7 +848,7 @@ if __name__ == "__main__":
     )
 
     print(
-        f"\n🚀 Starting training:"
+        f"\nStarting training:"
         f"\n   attack_steps         = {ATTACK_STEPS_PER_ITER}"
         f"\n   recover_steps        = {RECOVER_STEPS_PER_ITER}"
         f"\n   attack_every         = {ATTACK_EVERY}"

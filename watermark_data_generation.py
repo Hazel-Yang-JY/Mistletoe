@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 import random
 import torch
@@ -6,9 +8,9 @@ from torchvision import models, transforms
 from PIL import Image
 from torchvision.utils import save_image
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # Configuration
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 SEED_IMAGE    = "seed_point.jpeg"
 BASE_OUT_DIR  = r"./watermark"
 MODEL_PATH    = "resnet50.pth"
@@ -38,6 +40,123 @@ preprocess = transforms.Compose([
 ])
 
 VALID_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".JPEG", ".JPG", ".PNG")
+
+
+def parse_args():
+    """Build the command-line interface without changing method defaults."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate watermark samples and select a target label using "
+            "empirical FPR and gradient alignment."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--seed-image", default=SEED_IMAGE)
+    parser.add_argument("--train-dir", default=TRAIN_DIR)
+    parser.add_argument("--model-path", default=MODEL_PATH)
+    parser.add_argument("--output-dir", default=BASE_OUT_DIR)
+    parser.add_argument("--num-classes", type=int, default=NUM_CLASSES)
+    parser.add_argument("--num-samples", type=int, default=NUM_SAMPLES)
+    parser.add_argument("--augmentations-per-sample", type=int, default=9)
+    parser.add_argument("--perturb-dim", type=int, default=PERTURB_DIM)
+    parser.add_argument("--epsilon-min", type=float, default=EPSILON_RANGE[0])
+    parser.add_argument("--epsilon-max", type=float, default=EPSILON_RANGE[1])
+    parser.add_argument("--topk-candidates", type=int, default=TOPK_CANDIDATES)
+    parser.add_argument("--seed-class", default=SEED_CLASS)
+    parser.add_argument(
+        "--infer-seed-class",
+        action="store_true",
+        help="Use the model Top-1 prediction instead of --seed-class.",
+    )
+    parser.add_argument(
+        "--gradient-sample-size",
+        type=int,
+        default=MAIN_CLASS_SAMPLE_SIZE,
+        help="Approximate number of balanced task images used for the gradient estimate.",
+    )
+    parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=MAIN_CLASS_RANDOM_SEED,
+        help="Seed used only for balanced task-image sampling.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Optional global RNG seed; omitted by default to preserve legacy behavior.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+    )
+    return parser.parse_args()
+
+
+def resolve_device(name):
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but CUDA is unavailable.")
+    return torch.device(name)
+
+
+def validate_inputs(args):
+    """Fail early with actionable messages before expensive computation."""
+    required_files = {
+        "seed image": args.seed_image,
+        "model checkpoint": args.model_path,
+    }
+    for label, path in required_files.items():
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Missing {label}: {os.path.abspath(path)}")
+
+    if not os.path.isdir(args.train_dir):
+        raise NotADirectoryError(
+            f"Training directory not found: {os.path.abspath(args.train_dir)}"
+        )
+    if args.num_samples <= 0:
+        raise ValueError("--num-samples must be greater than zero.")
+    if args.num_classes <= 0:
+        raise ValueError("--num-classes must be greater than zero.")
+    if args.gradient_sample_size <= 0:
+        raise ValueError("--gradient-sample-size must be greater than zero.")
+    if args.augmentations_per_sample < 0:
+        raise ValueError("--augmentations-per-sample cannot be negative.")
+    if args.topk_candidates <= 0 or args.topk_candidates > args.num_classes:
+        raise ValueError("--topk-candidates must be in [1, --num-classes].")
+    if args.epsilon_min > args.epsilon_max:
+        raise ValueError("--epsilon-min cannot be greater than --epsilon-max.")
+
+
+def configure_from_args(args):
+    """Map CLI values to the existing implementation's configuration."""
+    global SEED_IMAGE, BASE_OUT_DIR, MODEL_PATH, TRAIN_DIR
+    global NUM_SAMPLES, PERTURB_DIM, EPSILON_RANGE, NUM_CLASSES
+    global TOPK_CANDIDATES, SEED_CLASS, USE_MANUAL_CLASS
+    global MAIN_CLASS_SAMPLE_SIZE, MAIN_CLASS_RANDOM_SEED, DEVICE
+
+    SEED_IMAGE = args.seed_image
+    BASE_OUT_DIR = args.output_dir
+    MODEL_PATH = args.model_path
+    TRAIN_DIR = args.train_dir
+    NUM_SAMPLES = args.num_samples
+    PERTURB_DIM = args.perturb_dim
+    EPSILON_RANGE = (args.epsilon_min, args.epsilon_max)
+    NUM_CLASSES = args.num_classes
+    TOPK_CANDIDATES = args.topk_candidates
+    SEED_CLASS = args.seed_class
+    USE_MANUAL_CLASS = not args.infer_seed_class
+    MAIN_CLASS_SAMPLE_SIZE = args.gradient_sample_size
+    MAIN_CLASS_RANDOM_SEED = args.sampling_seed
+    DEVICE = resolve_device(args.device)
+
+    if args.random_seed is not None:
+        random.seed(args.random_seed)
+        torch.manual_seed(args.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.random_seed)
 
 
 def load_model(model_path, num_classes, device):
@@ -80,7 +199,14 @@ def get_seed_logits_and_candidates(image_path, net, device, topk=10):
     return logits, probs, topk_indices[0].tolist(), top1_idx
 
 
-def generate_and_save(seed_image, out_dir, num_samples, perturb_dim, epsilon_range):
+def generate_and_save(
+    seed_image,
+    out_dir,
+    num_samples,
+    perturb_dim,
+    epsilon_range,
+    augmentations_per_sample=9,
+):
     from tools.vae import get_rec_image
     from tools.augment_perturb import augment
 
@@ -100,7 +226,7 @@ def generate_and_save(seed_image, out_dir, num_samples, perturb_dim, epsilon_ran
         )
         generated_paths.append(out_path)
 
-        for j in range(9):
+        for j in range(augmentations_per_sample):
             aug_path = os.path.join(out_dir, f"wm_{i+1:03d}_aug_{j+1:03d}.png")
             aug_img = augment(best_sample)
             save_image(aug_img, aug_path)
@@ -167,7 +293,7 @@ def compute_dataset_avg_gradient(net, image_paths, target_label, device):
             valid_count += 1
 
         except Exception as e:
-            print(f"⚠️ Skipping corrupted or unreadable image: {path} | {e}")
+            print(f"[WARN] Skipping corrupted or unreadable image: {path} | {e}")
 
     if grad_sum is None or valid_count == 0:
         return None
@@ -200,7 +326,7 @@ def compute_labeled_dataset_avg_gradient(net, labeled_samples, device):
             valid_count += 1
 
         except Exception as e:
-            print(f"⚠️ Skipping corrupted or unreadable image: {path} | {e}")
+            print(f"[WARN] Skipping corrupted or unreadable image: {path} | {e}")
 
     if grad_sum is None or valid_count == 0:
         return None
@@ -270,7 +396,7 @@ def sample_global_balanced_labeled_images(train_dir, per_class_samples, rng_seed
                 class_images.append(path)
 
         if len(class_images) == 0:
-            print(f"⚠️ 类别 {cls} 没有可用图像，跳过")
+            print(f"[WARN] Class {cls} contains no usable images; skipping.")
             continue
 
         if per_class_samples >= len(class_images):
@@ -315,7 +441,7 @@ def compute_empirical_fpr(net, image_paths, candidate_label, device):
             total += 1
 
         except Exception as e:
-            print(f"⚠️ Skipping image during FPR evaluation: {path} | {e}")
+            print(f"[WARN] Skipping image during FPR evaluation: {path} | {e}")
 
     fpr = hit / total if total > 0 else 1.0
     return fpr, hit, total
@@ -333,7 +459,7 @@ def inspect_candidate_scores(net, image_paths, candidate_label, device):
             probs.append(p)
 
         except Exception as e:
-            print(f"⚠️ Skipping image during probability inspection: {path} | {e}")
+            print(f"[WARN] Skipping image during probability inspection: {path} | {e}")
 
     if len(probs) == 0:
         return 0.0, 0.0
@@ -367,10 +493,30 @@ def select_best_label(results):
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    validate_inputs(args)
+    configure_from_args(args)
+
+    print("=" * 60)
+    print("Mistletoe | Stage 1/2: watermark data generation")
+    print(f"Device: {DEVICE}")
+    print(f"Seed image: {os.path.abspath(SEED_IMAGE)}")
+    print(f"Training data: {os.path.abspath(TRAIN_DIR)}")
+    print(f"Output root: {os.path.abspath(BASE_OUT_DIR)}")
+    print("=" * 60)
+
     class_folders = sorted([
         d for d in os.listdir(TRAIN_DIR)
         if os.path.isdir(os.path.join(TRAIN_DIR, d))
     ])
+
+    if not class_folders:
+        raise RuntimeError(f"No class folders found in TRAIN_DIR: {TRAIN_DIR}")
+    if len(class_folders) != NUM_CLASSES:
+        raise RuntimeError(
+            f"Found {len(class_folders)} class folders, but --num-classes is "
+            f"{NUM_CLASSES}. The dataset and checkpoint must use the same classes."
+        )
 
     net = load_model(MODEL_PATH, NUM_CLASSES, DEVICE)
 
@@ -393,23 +539,23 @@ if __name__ == "__main__":
 
     if USE_MANUAL_CLASS:
         if SEED_CLASS not in class_folders:
-            raise ValueError(f"❌ SEED_CLASS={SEED_CLASS} not found in TRAIN_DIR")
+            raise ValueError(f"SEED_CLASS={SEED_CLASS} not found in TRAIN_DIR")
 
         seed_top1_folder = SEED_CLASS
         seed_top1_idx = class_folders.index(SEED_CLASS)
 
-        print("⚠️ Using manually specified seed class, overriding model prediction")
+        print("[INFO] Using manually specified seed class, overriding model prediction")
 
     else:
         seed_top1_folder = class_folders[seed_top1_idx]
-        print("ℹ️ Using model-predicted Top-1 class as the seed class")
+        print("[INFO] Using model-predicted Top-1 class as the seed class")
 
     seed_class_dir = os.path.join(TRAIN_DIR, seed_top1_folder)
 
     print("-" * 60)
-    print(f"📌 Seed class: {seed_top1_folder} (Index: {seed_top1_idx})")
-    print(f"📌 Candidate labels (Top-{TOPK_CANDIDATES} logits): {candidate_indices}")
-    print(f"📌 Seed class directory: {seed_class_dir}")
+    print(f"Seed class: {seed_top1_folder} (Index: {seed_top1_idx})")
+    print(f"Candidate labels (Top-{TOPK_CANDIDATES} logits): {candidate_indices}")
+    print(f"Seed class directory: {seed_class_dir}")
     print("-" * 60)
 
     # 2. Sample balanced images from the whole task distribution to estimate the task gradient
@@ -424,11 +570,11 @@ if __name__ == "__main__":
 
     if len(main_class_paths) == 0:
         raise RuntimeError(
-            f"❌ No valid images found in the training directory: {TRAIN_DIR}"
+            f"No valid images found in the training directory: {TRAIN_DIR}"
         )
 
     print(
-        f"✅ Sampled {len(main_class_paths)} balanced images from the whole "
+        f"[OK] Sampled {len(main_class_paths)} balanced images from the whole "
         f"training distribution for estimating the main-task average gradient "
         f"({per_class_samples} per class)"
     )
@@ -441,11 +587,12 @@ if __name__ == "__main__":
         temp_out_dir,
         NUM_SAMPLES,
         PERTURB_DIM,
-        EPSILON_RANGE
+        EPSILON_RANGE,
+        augmentations_per_sample=args.augmentations_per_sample,
     )
 
-    print(f"✅ Watermark image generation completed. Temporary directory: {temp_out_dir}")
-    print(f"✅ Generated {len(generated_files)} watermark images")
+    print(f"[OK] Watermark image generation completed. Temporary directory: {temp_out_dir}")
+    print(f"[OK] Generated {len(generated_files)} watermark images")
 
     # 4. Compute the average gradient of the main task on the global task distribution
     main_grad = compute_labeled_dataset_avg_gradient(
@@ -456,21 +603,21 @@ if __name__ == "__main__":
 
     if main_grad is None:
         raise RuntimeError(
-            "❌ Failed to compute main_grad. Please check the images, "
+            "Failed to compute main_grad. Please check the images, "
             "model parameters, and training directory."
         )
 
     main_grad_norm = torch.norm(main_grad, p=2).item()
-    print(f"📌 Main-task average gradient norm: {main_grad_norm:.6f}")
+    print(f"Main-task average gradient norm: {main_grad_norm:.6f}")
 
-    print("\n🔍 Evaluating each candidate label ...\n")
+    print("\nEvaluating each candidate label ...\n")
 
     results = []
 
     for rank, cand_label in enumerate(candidate_indices, start=1):
         if cand_label >= len(class_folders):
             print(
-                f"⚠️ cand_label={cand_label} exceeds the range of class_folders. "
+                f"[WARN] cand_label={cand_label} exceeds the range of class_folders. "
                 f"Skipping."
             )
             continue
@@ -538,7 +685,7 @@ if __name__ == "__main__":
     best = select_best_label(results)
 
     print("\n" + "=" * 60)
-    print("📊 Candidate Label Evaluation Summary")
+    print("Candidate Label Evaluation Summary")
     print("=" * 60)
 
     for r in results:
@@ -550,11 +697,11 @@ if __name__ == "__main__":
         )
 
     print("\n" + "=" * 60)
-    print("🏆 Final Selection")
+    print("Final Selection")
     print("=" * 60)
 
     if best is None:
-        print("❌ No valid label was found.")
+        print("[ERROR] No valid label was found.")
 
     else:
         print(f"Best label: {best['label_folder']} (Index {best['label_idx']})")
@@ -565,6 +712,29 @@ if __name__ == "__main__":
         print(f"Gradient cosine similarity: {best['grad_cosine']}")
         print(f"Watermark gradient norm: {best['wm_grad_norm']}")
 
+        os.makedirs(BASE_OUT_DIR, exist_ok=True)
+        summary_path = os.path.join(BASE_OUT_DIR, "selection.json")
+        with open(summary_path, "w", encoding="utf-8") as summary_file:
+            json.dump(
+                {
+                    "selected": best,
+                    "candidates": results,
+                    "generation": {
+                        "seed_image": os.path.abspath(SEED_IMAGE),
+                        "model_path": os.path.abspath(MODEL_PATH),
+                        "num_samples": NUM_SAMPLES,
+                        "augmentations_per_sample": args.augmentations_per_sample,
+                        "perturb_dim": PERTURB_DIM,
+                        "epsilon_range": list(EPSILON_RANGE),
+                        "sampling_seed": MAIN_CLASS_RANDOM_SEED,
+                        "random_seed": args.random_seed,
+                    },
+                },
+                summary_file,
+                indent=2,
+            )
+        print(f"Selection summary: {summary_path}")
+
         # Optional: rename temp_generated to the final class directory
         final_out_dir = os.path.join(BASE_OUT_DIR, best["label_folder"])
 
@@ -572,13 +742,13 @@ if __name__ == "__main__":
             os.makedirs(BASE_OUT_DIR, exist_ok=True)
 
             if os.path.exists(final_out_dir):
-                print(f"\n⚠️ Target directory already exists: {final_out_dir}")
+                print(f"\n[WARN] Target directory already exists: {final_out_dir}")
                 print(
                     "   Please manually handle the files in temp_generated "
                     "if needed."
                 )
             else:
                 os.rename(temp_out_dir, final_out_dir)
-                print(f"\n✅ Renamed generated directory to: {final_out_dir}")
+                print(f"\n[OK] Renamed generated directory to: {final_out_dir}")
 
     print("=" * 60)
