@@ -173,24 +173,6 @@ Frequently adjusted training options:
 | `--align-layers` | Parameter-name fragments eligible for alignment |
 | `--no-amp` | Disable mixed precision |
 
-## Adapting to another architecture or dataset
-
-The current code assumes ResNet-50 in both `load_model` functions and uses ImageNet normalization. For another architecture, update:
-
-1. model construction and the classifier head;
-2. preprocessing transforms expected by that model;
-3. `--align-layers` so its values match the new parameter names;
-4. dataset class folders and `--num-classes` so indices remain consistent.
-
-The watermark selection and alignment routines are otherwise separated from model loading, making these the main architecture-specific touchpoints.
-
-## Reproducibility notes
-
-- Pass the same `--random-seed` for comparable runs. When omitted, the scripts preserve the original stochastic behavior.
-- Keep class-folder names and lexicographic ordering identical between train and validation splits.
-- Generation is computationally expensive because it computes per-image parameter gradients for multiple candidate labels.
-- If `watermark/<selected-class>` already exists, generated files remain in `watermark/temp_generated` to avoid overwriting prior results.
-- Watermark images are used for both watermark training and validation in the core implementation; use a separate split if your evaluation protocol requires strict holdout data.
 
 ## Disclaimer
 
